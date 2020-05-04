@@ -32,7 +32,7 @@ def save_gdf_shapefile(gdf, filename=None, folder=None):
     gdf : GeoDataFrame
         the gdf to be saved
     filename : string
-        what to call the shapefile (file extensions are added automatically)
+        the name of the shapefiles (not including file extensions)
     folder : string
         where to save the shapefile, if none, then default folder
 
@@ -49,7 +49,7 @@ def save_gdf_shapefile(gdf, filename=None, folder=None):
 
     # give the save folder a filename subfolder to make the full path to the
     # files
-    folder_path = os.path.join(folder, filename)
+    filepath = os.path.join(folder, filename)
 
     # make everything but geometry column a string
     for col in [c for c in gdf.columns if not c == 'geometry']:
@@ -57,13 +57,56 @@ def save_gdf_shapefile(gdf, filename=None, folder=None):
 
     # if the save folder does not already exist, create it with a filename
     # subfolder
-    if not os.path.exists(folder_path):
-        os.makedirs(folder_path)
-    gdf.to_file(folder_path)
+    if not os.path.exists(filepath):
+        os.makedirs(filepath)
+    gdf.to_file(filepath)
 
     if not hasattr(gdf, 'gdf_name'):
         gdf.gdf_name = 'unnamed'
-    log('Saved the GeoDataFrame "{}" as shapefile "{}"'.format(gdf.gdf_name, folder_path))
+    log('Saved the GeoDataFrame "{}" as shapefile "{}"'.format(gdf.gdf_name, filepath))
+
+
+def save_graph_geopackage(G, filename='graph.gpkg', folder=None, encoding='utf-8'):
+    """
+    Save graph nodes and edges as to disk as layers in a GeoPackage file.
+
+    Parameters
+    ----------
+    G : networkx multidigraph
+    filename : string
+        the filename of the GeoPackage including file extension
+    folder : string
+        the path to the folder to contain the GeoPackage, if None, use default data folder
+    encoding : string
+        the character encoding for the saved files
+
+    Returns
+    -------
+    None
+    """
+
+    # convert undirected graph to geodataframes
+    start_time = time.time()
+    gdf_nodes, gdf_edges = graph_to_gdfs(get_undirected(G))
+
+    # make every non-numeric edge attribute (besides geometry) a string
+    for col in [c for c in gdf_edges.columns if not c == 'geometry']:
+        if not pd.api.types.is_numeric_dtype(gdf_edges[col]):
+            gdf_edges[col] = gdf_edges[col].fillna('').map(str)
+
+    # use settings.data_folder if a folder wasn't passed in
+    # if the save folder does not already exist, create it
+    if folder is None:
+        folder = settings.data_folder
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+    filepath = os.path.join(folder, filename)
+
+    # save the nodes and edges as GeoPackage layers
+    gdf_nodes.to_file(filepath, layer='nodes', driver='GPKG', encoding=encoding)
+    gdf_edges.to_file(filepath, layer='edges', driver='GPKG', encoding=encoding)
+    log('Saved graph to disk as GeoPackage at "{}" in {:,.2f} seconds'.format(filepath, time.time() - start_time))
+
 
 
 def save_graph_shapefile(G, filename='graph', folder=None, encoding='utf-8'):
@@ -111,7 +154,7 @@ def save_graph_shapefile(G, filename='graph', folder=None, encoding='utf-8'):
 
         # for each edge, add key and all attributes in data dict to the
         # edge_details
-        edge_details = {'key':key}
+        edge_details = {'key': key}
         for attr_key in data:
             edge_details[attr_key] = data[attr_key]
 
@@ -133,14 +176,14 @@ def save_graph_shapefile(G, filename='graph', folder=None, encoding='utf-8'):
 
     # if the save folder does not already exist, create it with a filename
     # subfolder
-    folder = os.path.join(folder, filename)
-    if not os.path.exists(folder):
-        os.makedirs(folder)
+    filepath = os.path.join(folder, filename)
+    if not os.path.exists(filepath):
+        os.makedirs(filepath)
 
     # save the nodes and edges as separate ESRI shapefiles
-    gdf_nodes.to_file('{}/nodes'.format(folder), encoding=encoding)
-    gdf_edges.to_file('{}/edges'.format(folder), encoding=encoding)
-    log('Saved graph "{}" to disk as shapefiles at "{}" in {:,.2f} seconds'.format(G_save.name, folder, time.time() - start_time))
+    gdf_nodes.to_file('{}/nodes'.format(filepath), encoding=encoding)
+    gdf_edges.to_file('{}/edges'.format(filepath), encoding=encoding)
+    log('Saved graph "{}" to disk as shapefiles at "{}" in {:,.2f} seconds'.format(G_save.name, filepath, time.time() - start_time))
 
 
 def save_as_osm(
@@ -246,8 +289,9 @@ def save_as_osm(
         node = etree.SubElement(
             root, 'node', attrib=row[node_attrs].dropna().to_dict())
         for tag in node_tags:
-            etree.SubElement(
-                node, 'tag', attrib={'k': tag, 'v': row[tag]})
+            if tag in nodes.columns:
+                etree.SubElement(
+                    node, 'tag', attrib={'k': tag, 'v': row[tag]})
 
     # append edges to the XML tree
     if merge_edges:
@@ -273,17 +317,21 @@ def save_as_osm(
 
             if edge_tag_aggs is None:
                 for tag in edge_tags:
-                    etree.SubElement(
-                        edge, 'tag', attrib={'k': tag, 'v': first[tag]})
-            else:
-                for tag in edge_tags:
-                    if tag not in [t for t, agg in edge_tag_aggs]:
+                    if tag in all_way_edges.columns:
                         etree.SubElement(
                             edge, 'tag', attrib={'k': tag, 'v': first[tag]})
+            else:
+                for tag in edge_tags:
+                    if tag in all_way_edges.columns:
+                        if tag not in [t for t, agg in edge_tag_aggs]:
+                            etree.SubElement(
+                                edge, 'tag',
+                                attrib={'k': tag, 'v': first[tag]})
 
                 for tag, agg in edge_tag_aggs:
-                    etree.SubElement(edge, 'tag', attrib={
-                        'k': tag, 'v': all_way_edges[tag].aggregate(agg)})
+                    if tag in all_way_edges.columns:
+                        etree.SubElement(edge, 'tag', attrib={
+                            'k': tag, 'v': all_way_edges[tag].aggregate(agg)})
 
     else:
 
@@ -299,8 +347,9 @@ def save_as_osm(
             etree.SubElement(edge, 'nd', attrib={'ref': row['u']})
             etree.SubElement(edge, 'nd', attrib={'ref': row['v']})
             for tag in edge_tags:
-                etree.SubElement(
-                    edge, 'tag', attrib={'k': tag, 'v': row[tag]})
+                if tag in edges.columns:
+                    etree.SubElement(
+                        edge, 'tag', attrib={'k': tag, 'v': row[tag]})
 
     et = etree.ElementTree(root)
 
@@ -379,9 +428,10 @@ def save_graphml(G, filename='graph.graphml', folder=None, gephi=False):
 
     if not os.path.exists(folder):
         os.makedirs(folder)
+    filepath = os.path.join(folder, filename)
 
-    nx.write_graphml(G_save, os.path.join(folder, filename))
-    log('Saved graph "{}" to disk as GraphML at "{}" in {:,.2f} seconds'.format(G_save.name, os.path.join(folder, filename), time.time()-start_time))
+    nx.write_graphml(G_save, filepath)
+    log('Saved graph to disk as GraphML at "{}" in {:,.2f} seconds'.format(filepath, time.time()-start_time))
 
 
 def load_graphml(filename, folder=None, node_type=int):
@@ -424,18 +474,27 @@ def load_graphml(filename, folder=None, node_type=int):
         data['osmid'] = node_type(data['osmid'])
         data['x'] = float(data['x'])
         data['y'] = float(data['y'])
+        if 'elevation' in data:
+            data['elevation'] = float(data['elevation'])
+        if 'elevation_res' in data:
+            data['elevation_res'] = float(data['elevation_res'])
 
-    # convert numeric, bool, and list node tags from string to correct data types
+    # convert numeric, bool, and list edge attributes from string to correct data types
     for _, _, data in G.edges(data=True, keys=False):
 
         # first parse oneway to bool and length to float - they should always
         # have only 1 value each
         data['oneway'] = ast.literal_eval(data['oneway'])
         data['length'] = float(data['length'])
+        if 'grade' in data:
+            data['grade'] = float(data['grade'])
+        if 'grade_abs' in data:
+            data['grade_abs'] = float(data['grade_abs'])
 
         # these attributes might have a single value, or a list if edge's
         # topology was simplified
-        for attr in ['highway', 'name', 'bridge', 'tunnel', 'lanes', 'ref', 'maxspeed', 'service', 'access', 'area', 'landuse', 'width', 'est_width']:
+        for attr in ['highway', 'name', 'bridge', 'tunnel', 'lanes', 'ref', 'maxspeed',
+                     'service', 'access', 'area', 'landuse', 'width', 'est_width']:
             # if this edge has this attribute, and it starts with '[' and ends
             # with ']', then it's a list to be parsed
             if attr in data and data[attr].startswith('[') and data[attr].endswith(']'):

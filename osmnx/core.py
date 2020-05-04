@@ -155,7 +155,7 @@ def gdf_from_places(queries, gdf_name='unnamed', buffer_dist=None, which_results
 def osm_net_download(polygon=None, north=None, south=None, east=None, west=None,
                      network_type='all_private', timeout=180, memory=None,
                      max_query_area_size=50*1000*50*1000, infrastructure='way["highway"]',
-                     custom_filter=None):
+                     custom_filter=None, custom_settings=None):
     """
     Download OSM ways and nodes within some bounding box from the Overpass API.
 
@@ -190,6 +190,9 @@ def osm_net_download(polygon=None, north=None, south=None, east=None, west=None,
         grids, ie, 'way["power"~"line"]'
     custom_filter : string
         a custom network filter to be used instead of the network_type presets
+    custom_settings : string
+        custom settings to be used in the overpass query instead of the default
+        ones
 
     Returns
     -------
@@ -221,6 +224,12 @@ def osm_net_download(polygon=None, north=None, south=None, east=None, west=None,
     else:
         maxsize = '[maxsize:{}]'.format(memory)
 
+    # use custom settings if delivered, otherwise just the default ones.
+    if custom_settings:
+        overpass_settings = custom_settings
+    else:
+        overpass_settings = settings.default_overpass_query_settings.format(timeout=timeout, maxsize=maxsize)
+
     # define the query to send the API
     # specifying way["highway"] means that all ways returned must have a highway
     # key. the {filters} then remove ways by key/value. the '>' makes it recurse
@@ -244,12 +253,12 @@ def osm_net_download(polygon=None, north=None, south=None, east=None, west=None,
             # decimal places (ie, ~100 mm) so URL strings aren't different
             # due to float rounding issues (for consistent caching)
             west, south, east, north = poly.bounds
-            query_template = '[out:json][timeout:{timeout}]{maxsize};({infrastructure}{filters}({south:.6f},{west:.6f},{north:.6f},{east:.6f});>;);out;'
+            query_template = '{settings};({infrastructure}{filters}({south:.6f},{west:.6f},{north:.6f},{east:.6f});>;);out;'
             query_str = query_template.format(north=north, south=south,
                                               east=east, west=west,
                                               infrastructure=infrastructure,
                                               filters=osm_filter,
-                                              timeout=timeout, maxsize=maxsize)
+                                              settings=overpass_settings)
             response_json = overpass_request(data={'data':query_str}, timeout=timeout)
             response_jsons.append(response_json)
         log('Got all network data within bounding box from API in {:,} request(s) and {:,.2f} seconds'.format(len(geometry), time.time()-start_time))
@@ -268,8 +277,11 @@ def osm_net_download(polygon=None, north=None, south=None, east=None, west=None,
         # pass each polygon exterior coordinates in the list to the API, one at
         # a time
         for polygon_coord_str in polygon_coord_strs:
-            query_template = '[out:json][timeout:{timeout}]{maxsize};({infrastructure}{filters}(poly:"{polygon}");>;);out;'
-            query_str = query_template.format(polygon=polygon_coord_str, infrastructure=infrastructure, filters=osm_filter, timeout=timeout, maxsize=maxsize)
+            query_template = '{settings};({infrastructure}{filters}(poly:"{polygon}");>;);out;'
+            query_str = query_template.format(polygon=polygon_coord_str,
+                                              infrastructure=infrastructure,
+                                              filters=osm_filter,
+                                              settings=overpass_settings)
             response_json = overpass_request(data={'data':query_str}, timeout=timeout)
             response_jsons.append(response_json)
         log('Got all network data within polygon from API in {:,} request(s) and {:,.2f} seconds'.format(len(polygon_coord_strs), time.time()-start_time))
@@ -702,7 +714,7 @@ def truncate_graph_polygon(G, polygon, retain_all=False, truncate_by_edge=False,
         if True, return the entire graph even if it is not connected
     truncate_by_edge : bool
         if True retain node if it's outside polygon but at least one of node's
-        neighbors are within polygon (NOT CURRENTLY IMPLEMENTED)
+        neighbors are within polygon
     quadrat_width : numeric
         passed on to intersect_index_quadrats: the linear length (in degrees) of
         the quadrats with which to cut up the geometry (default = 0.05, approx
@@ -733,10 +745,20 @@ def truncate_graph_polygon(G, polygon, retain_all=False, truncate_by_edge=False,
     points_within_geometry = intersect_index_quadrats(gdf_nodes, polygon, quadrat_width=quadrat_width, min_num=min_num, buffer_amount=buffer_amount)
     nodes_outside_polygon = gdf_nodes[~gdf_nodes.index.isin(points_within_geometry.index)]
 
+    if truncate_by_edge:
+        nodes_to_remove = []
+        for node in nodes_outside_polygon['node']:
+            neighbors = pd.Series(list(G.successors(node)) + list(G.predecessors(node)))
+            # check if all the neighbors of this node also lie outside polygon
+            if neighbors.isin(nodes_outside_polygon['node']).all():
+                nodes_to_remove.append(node)
+    else:
+        nodes_to_remove = nodes_outside_polygon['node']
+
     # now remove from the graph all those nodes that lie outside the place
     # polygon
     start_time = time.time()
-    G.remove_nodes_from(nodes_outside_polygon['node'])
+    G.remove_nodes_from(nodes_to_remove)
     log('Removed {:,} nodes outside polygon in {:,.2f} seconds'.format(len(nodes_outside_polygon), time.time()-start_time))
 
     # remove any isolated nodes and retain only the largest component (if retain_all is False)
@@ -765,7 +787,11 @@ def add_edge_lengths(G):
 
     # first load all the edges' origin and destination coordinates as a
     # dataframe indexed by u, v, key
-    coords = np.array([[u, v, k, G.nodes[u]['y'], G.nodes[u]['x'], G.nodes[v]['y'], G.nodes[v]['x']] for u, v, k in G.edges(keys=True)])
+    try:
+        coords = np.array([[u, v, k, G.nodes[u]['y'], G.nodes[u]['x'], G.nodes[v]['y'], G.nodes[v]['x']] for u, v, k in G.edges(keys=True)])
+    except KeyError:
+        missing_nodes = {str(i) for u, v, _ in G.edges(keys=True) if not(G.nodes[u] or G.nodes[u]) for i in (u, v) if not G.nodes[i]}
+        raise TypeError('Edge(s) with missing nodes {} possibly due to a clipping issue'.format(', '.join(missing_nodes)))
     df_coords = pd.DataFrame(coords, columns=['u', 'v', 'k', 'u_y', 'u_x', 'v_y', 'v_x'])
     df_coords[['u', 'v', 'k']] = df_coords[['u', 'v', 'k']].astype(np.int64)
     df_coords = df_coords.set_index(['u', 'v', 'k'])
@@ -992,7 +1018,8 @@ def graph_from_bbox(north, south, east, west, network_type='all_private',
                     simplify=True, retain_all=False, truncate_by_edge=False,
                     name='unnamed', timeout=180, memory=None,
                     max_query_area_size=50*1000*50*1000, clean_periphery=True,
-                    infrastructure='way["highway"]', custom_filter=None):
+                    infrastructure='way["highway"]', custom_filter=None,
+                    custom_settings=None):
     """
     Create a networkx graph from OSM data within some bounding box.
 
@@ -1033,6 +1060,9 @@ def graph_from_bbox(north, south, east, west, network_type='all_private',
         infrastructures may be selected like power grids (ie, 'way["power"~"line"]'))
     custom_filter : string
         a custom network filter to be used instead of the network_type presets
+    custom_settings : string
+        custom settings to be used in the overpass query instead of the default
+        ones
 
     Returns
     -------
@@ -1053,7 +1083,8 @@ def graph_from_bbox(north, south, east, west, network_type='all_private',
                                           east=east_buffered, west=west_buffered,
                                           network_type=network_type, timeout=timeout,
                                           memory=memory, max_query_area_size=max_query_area_size,
-                                          infrastructure=infrastructure, custom_filter=custom_filter)
+                                          infrastructure=infrastructure, custom_filter=custom_filter,
+                                          custom_settings=custom_settings)
         G_buffered = create_graph(response_jsons, name=name, retain_all=retain_all,
                                   bidirectional=network_type in settings.bidirectional_network_types)
         G = truncate_graph_bbox(G_buffered, north, south, east, west, retain_all=True, truncate_by_edge=truncate_by_edge)
@@ -1076,7 +1107,8 @@ def graph_from_bbox(north, south, east, west, network_type='all_private',
                                           west=west, network_type=network_type,
                                           timeout=timeout, memory=memory,
                                           max_query_area_size=max_query_area_size,
-                                          infrastructure=infrastructure, custom_filter=custom_filter)
+                                          infrastructure=infrastructure, custom_filter=custom_filter,
+                                          custom_settings=custom_settings)
 
         # create the graph, then truncate to the bounding box
         G = create_graph(response_jsons, name=name, retain_all=retain_all,
@@ -1099,7 +1131,7 @@ def graph_from_point(center_point, distance=1000, distance_type='bbox',
                      truncate_by_edge=False, name='unnamed', timeout=180,
                      memory=None, max_query_area_size=50*1000*50*1000,
                      clean_periphery=True, infrastructure='way["highway"]',
-                     custom_filter=None):
+                     custom_filter=None, custom_settings=None):
     """
     Create a networkx graph from OSM data within some distance of some (lat,
     lon) center point.
@@ -1142,6 +1174,9 @@ def graph_from_point(center_point, distance=1000, distance_type='bbox',
         infrastructures may be selected like power grids (ie, 'way["power"~"line"]'))
     custom_filter : string
         a custom network filter to be used instead of the network_type presets
+    custom_settings : string
+        custom settings to be used in the overpass query instead of the default
+        ones
 
     Returns
     -------
@@ -1160,7 +1195,7 @@ def graph_from_point(center_point, distance=1000, distance_type='bbox',
                         retain_all=retain_all, truncate_by_edge=truncate_by_edge, name=name,
                         timeout=timeout, memory=memory, max_query_area_size=max_query_area_size,
                         clean_periphery=clean_periphery, infrastructure=infrastructure,
-                        custom_filter=custom_filter)
+                        custom_filter=custom_filter, custom_settings=custom_settings)
 
     # if the network distance_type is network, find the node in the graph
     # nearest to the center point, and truncate the graph by network distance
@@ -1179,7 +1214,7 @@ def graph_from_address(address, distance=1000, distance_type='bbox',
                        name='unnamed', timeout=180, memory=None,
                        max_query_area_size=50*1000*50*1000,
                        clean_periphery=True, infrastructure='way["highway"]',
-                       custom_filter=None):
+                       custom_filter=None, custom_settings=None):
     """
     Create a networkx graph from OSM data within some distance of some address.
 
@@ -1225,6 +1260,9 @@ def graph_from_address(address, distance=1000, distance_type='bbox',
         infrastructures may be selected like power grids (ie, 'way["power"~"line"]'))
     custom_filter : string
         a custom network filter to be used instead of the network_type presets
+    custom_settings : string
+        custom settings to be used in the overpass query instead of the default
+        ones
 
     Returns
     -------
@@ -1241,7 +1279,7 @@ def graph_from_address(address, distance=1000, distance_type='bbox',
                          name=name, timeout=timeout, memory=memory,
                          max_query_area_size=max_query_area_size,
                          clean_periphery=clean_periphery, infrastructure=infrastructure,
-                         custom_filter=custom_filter)
+                         custom_filter=custom_filter, custom_settings=custom_settings)
     log('graph_from_address() returning graph with {:,} nodes and {:,} edges'.format(len(list(G.nodes())), len(list(G.edges()))))
 
     if return_coords:
@@ -1255,7 +1293,7 @@ def graph_from_polygon(polygon, network_type='all_private', simplify=True,
                        timeout=180, memory=None,
                        max_query_area_size=50*1000*50*1000,
                        clean_periphery=True, infrastructure='way["highway"]',
-                       custom_filter=None):
+                       custom_filter=None, custom_settings=None):
     """
     Create a networkx graph from OSM data within the spatial boundaries of the
     passed-in shapely polygon.
@@ -1293,6 +1331,9 @@ def graph_from_polygon(polygon, network_type='all_private', simplify=True,
         like power grids (ie, 'way["power"~"line"]'))
     custom_filter : string
         a custom network filter to be used instead of the network_type presets
+    custom_settings : string
+        custom settings to be used in the overpass query instead of the default
+        ones
 
     Returns
     -------
@@ -1321,7 +1362,8 @@ def graph_from_polygon(polygon, network_type='all_private', simplify=True,
         response_jsons = osm_net_download(polygon=polygon_buffered, network_type=network_type,
                                           timeout=timeout, memory=memory,
                                           max_query_area_size=max_query_area_size,
-                                          infrastructure=infrastructure, custom_filter=custom_filter)
+                                          infrastructure=infrastructure, custom_filter=custom_filter,
+                                          custom_settings=custom_settings)
         G_buffered = create_graph(response_jsons, name=name, retain_all=True,
                                   bidirectional=network_type in settings.bidirectional_network_types)
         G_buffered = truncate_graph_polygon(G_buffered, polygon_buffered, retain_all=True, truncate_by_edge=truncate_by_edge)
@@ -1346,7 +1388,8 @@ def graph_from_polygon(polygon, network_type='all_private', simplify=True,
         response_jsons = osm_net_download(polygon=polygon, network_type=network_type,
                                           timeout=timeout, memory=memory,
                                           max_query_area_size=max_query_area_size,
-                                          infrastructure=infrastructure, custom_filter=custom_filter)
+                                          infrastructure=infrastructure, custom_filter=custom_filter,
+                                          custom_settings=custom_settings)
 
         # create the graph from the downloaded data
         G = create_graph(response_jsons, name=name, retain_all=True,
@@ -1370,7 +1413,8 @@ def graph_from_place(query, network_type='all_private', simplify=True,
                      retain_all=False, truncate_by_edge=False, name='unnamed',
                      which_result=1, buffer_dist=None, timeout=180, memory=None,
                      max_query_area_size=50*1000*50*1000, clean_periphery=True,
-                     infrastructure='way["highway"]', custom_filter=None):
+                     infrastructure='way["highway"]', custom_filter=None,
+                     custom_settings=None):
     """
     Create a networkx graph from OSM data within the spatial boundaries of some
     geocodable place(s).
@@ -1420,7 +1464,9 @@ def graph_from_place(query, network_type='all_private', simplify=True,
         infrastructures may be selected like power grids (ie, 'way["power"~"line"]'))
     custom_filter : string
         a custom network filter to be used instead of the network_type presets
-
+    custom_settings : string
+        custom settings to be used in the overpass query instead of the default
+        ones
     Returns
     -------
     networkx multidigraph
@@ -1448,7 +1494,7 @@ def graph_from_place(query, network_type='all_private', simplify=True,
                            name=name, timeout=timeout, memory=memory,
                            max_query_area_size=max_query_area_size,
                            clean_periphery=clean_periphery, infrastructure=infrastructure,
-                           custom_filter=custom_filter)
+                           custom_filter=custom_filter, custom_settings=custom_settings)
 
     log('graph_from_place() returning graph with {:,} nodes and {:,} edges'.format(len(list(G.nodes())), len(list(G.edges()))))
     return G
